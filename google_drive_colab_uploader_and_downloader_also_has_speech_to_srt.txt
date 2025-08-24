@@ -1,0 +1,1126 @@
+# @title 📁 Google Colab Download/Upload Bot (Enhanced with AI Transcription)
+# @markdown ### Configuration - Enter your bot credentials
+API_ID = "25"  # @param {type:"string"}
+API_HASH = "8"  # @param {type:"string"}
+BOT_TOKEN = "8"  # @param {type:"string"}
+GDRIVE_FOLDER_NAME = "TelegramBot"  # @param {type:"string"}
+
+# @markdown ### Enhanced Whisper Settings (from your Extract Audio notebook)
+device = "cuda"  # @param ["cuda", "cpu"]
+model_size = 'large-v3'  # @param ["large-v3", "distil-large-v2", "distil-medium.en"]
+compute_type = "float16"  # @param ["float16", "int8_float16", "int8"]
+beam_size = 5  # @param {type:"integer"}
+whisper_debug = True  # @param {type: "boolean"}
+
+# Silero VAD
+vad_filter = True  # @param {type:"boolean"}
+threshold = 0.5  # @param {type:"number"}
+min_speech_duration_ms = 250  # @param {type:"integer"}
+max_speech_duration_s = 12  # @param {type:"number"}
+min_silence_duration_ms = 2000   # @param {type:"integer"}
+window_size_samples = 1024  # @param [512, 1024, 1536]
+speech_pad_ms = 400  # @param {type:"integer"}
+
+# SRT Generation
+use_whisper_sentence_segment = False  # @param {type: "boolean"}
+max_text_len = 110  # @param {type:"integer"}
+max_segment_interval = 1.5  # @param {type:"number"}
+
+print("📦 Installing required packages...")
+# Install dependencies
+!pip install -q nest-asyncio pyrogram tgcrypto aiofiles pillow
+!pip install -q faster-whisper srt
+!apt-get update &> /dev/null
+!apt-get install -y rclone ffmpeg &> /dev/null
+
+import nest_asyncio
+import os
+import asyncio
+import time
+import json
+import shutil
+import subprocess
+import random
+import copy
+import srt
+from pathlib import Path
+from PIL import Image, ImageDraw
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from google.colab import drive, files
+from datetime import timedelta
+
+# Import Whisper after installation
+try:
+    from faster_whisper import WhisperModel
+    whisper_available = True
+    print("✅ Whisper model available for transcription")
+except ImportError:
+    whisper_available = False
+    print("⚠️ Whisper not available - transcription disabled")
+
+nest_asyncio.apply()
+
+# Progress tracker functions (based on your existing Extract audio notebook pattern)
+def size_unit(size_bytes):
+    """Convert bytes to human readable format"""
+    if size_bytes == 0:
+        return "0B"
+    size_names = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while size_bytes >= 1024 and i < len(size_names) - 1:
+        size_bytes /= 1024.0
+        i += 1
+    return f"{size_bytes:.2f}{size_names[i]}"
+
+def create_progress_bar(percentage, length=20):
+    """Create a visual progress bar"""
+    filled = int(length * percentage / 100)
+    bar = '█' * filled + '░' * (length - filled)
+    return f"[{bar}]"
+
+def format_time(seconds):
+    """Format seconds into readable time"""
+    if seconds < 0:
+        return "Calculating..."
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours}h {minutes}m"
+
+def generate_random_thumbnail(filename, output_path):
+    """Generate a random colorful thumbnail for videos"""
+    try:
+        width, height = 320, 180
+        colors = [(255, 99, 71), (60, 179, 113), (30, 144, 255), (255, 165, 0), 
+                 (138, 43, 226), (255, 20, 147), (0, 255, 255), (255, 215, 0)]
+        
+        color = random.choice(colors)
+        img = Image.new('RGB', (width, height), color)
+        draw = ImageDraw.Draw(img)
+        
+        # Add filename text
+        text = filename[:25] + "..." if len(filename) > 25 else filename
+        bbox = draw.textbbox((0, 0), text)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        
+        x = (width - text_width) // 2
+        y = (height - text_height) // 2
+        
+        # Add shadow
+        draw.text((x+2, y+2), text, fill=(0, 0, 0, 128))
+        # Add main text
+        draw.text((x, y), text, fill=(255, 255, 255))
+        
+        # Add play button symbol
+        play_size = 30
+        play_x = width - play_size - 10
+        play_y = height - play_size - 10
+        draw.polygon([(play_x, play_y), (play_x, play_y + play_size), 
+                     (play_x + play_size, play_y + play_size//2)], 
+                    fill=(255, 255, 255), outline=(0, 0, 0))
+        
+        img.save(output_path, 'JPEG', quality=85)
+        return output_path
+    except Exception as e:
+        print(f"Error generating thumbnail: {e}")
+        return None
+
+def extract_video_thumbnail(video_path, output_path, time_pos="00:00:01"):
+    """Extract thumbnail from video using FFmpeg"""
+    try:
+        cmd = [
+            'ffmpeg', '-i', str(video_path), '-ss', time_pos,
+            '-vframes', '1', '-vf', 'scale=320:180',
+            '-y', str(output_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0 and os.path.exists(output_path):
+            return output_path
+        return None
+    except Exception as e:
+        print(f"Error extracting thumbnail: {e}")
+        return None
+
+def extract_audio_from_video(video_path, audio_path):
+    """Extract audio from video using FFmpeg"""
+    try:
+        cmd = [
+            'ffmpeg', '-i', str(video_path), 
+            '-vn', '-acodec', 'libmp3lame', '-ab', '192k', '-ar', '44100', '-y',
+            str(audio_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0 and os.path.exists(audio_path):
+            return True
+        else:
+            print(f"FFmpeg error: {result.stderr}")
+            return False
+    except Exception as e:
+        print(f"Error extracting audio: {e}")
+        return False
+
+def sentence_segments_merger(segments, max_text_len=110, max_segment_interval=1.5):
+    """
+    Merge sentence segments to one segment, if the length of the text is less than max_text_len.
+    """
+    if not segments:
+        return []
+
+    merged_segments = []
+    current_segment = {"text": "", "start": 0, "end": 0}
+    current_segment_template = {"text": "", "start": 0, "end": 0}
+    is_current_segment_empty = True
+
+    for i, segment in enumerate(segments):
+        # remove empty lines
+        segment_text = segment["text"].strip()
+        if not segment_text:
+            continue
+
+        if is_current_segment_empty:
+            current_segment["start"] = segment["start"]
+            current_segment["end"] = segment["end"]
+            current_segment["text"] = segment["text"].strip()
+            is_current_segment_empty = False
+            continue
+
+        if segment["start"] - current_segment["end"] < max_segment_interval and \
+                len(current_segment["text"] + " " + segment_text) < max_text_len:
+            current_segment["text"] += " " + segment_text
+            current_segment["text"] = current_segment["text"].strip()
+            current_segment["end"] = segment["end"]
+        else:
+            current_segment["text"] = current_segment["text"].strip()
+            merged_segments.append(copy.deepcopy(current_segment))
+            current_segment = copy.deepcopy(current_segment_template)
+            is_current_segment_empty = True
+
+    if not is_current_segment_empty:
+        current_segment["text"] = current_segment["text"].strip()
+        merged_segments.append(copy.deepcopy(current_segment))
+
+    return merged_segments
+
+class DownloadUploadTracker:
+    """Track download/upload progress (based on your existing DownloadTracker)"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset tracking"""
+        self.status_message = None
+        self.start_time = None
+        self.current_bytes = 0
+        self.total_bytes = 0
+        self.speed = 0
+        self.eta = 0
+        self.filename = ""
+        self.is_active = False
+        self.last_update = 0
+        self.operation = "Processing"
+
+    def start_operation(self, filename, total_size, operation="Processing"):
+        """Start operation tracking"""
+        self.filename = filename
+        self.total_bytes = total_size
+        self.start_time = time.time()
+        self.current_bytes = 0
+        self.is_active = True
+        self.last_update = 0
+        self.operation = operation
+
+    async def update_progress(self, current_bytes, total_bytes):
+        """Update progress"""
+        now = time.time()
+
+        # Update every 2 seconds to avoid spam
+        if now - self.last_update < 2:
+            return
+        self.last_update = now
+
+        self.current_bytes = current_bytes
+        if total_bytes > 0:
+            self.total_bytes = total_bytes
+
+        elapsed = now - self.start_time if self.start_time else 0
+
+        if elapsed > 0:
+            self.speed = current_bytes / elapsed
+            if self.speed > 0 and self.total_bytes > 0:
+                self.eta = (self.total_bytes - current_bytes) / self.speed
+            else:
+                self.eta = 0
+        else:
+            self.speed = 0
+            self.eta = 0
+
+        await self._update_status()
+
+    async def complete_operation(self, success=True):
+        """Complete operation tracking"""
+        self.is_active = False
+        if success and self.total_bytes > 0:
+            self.current_bytes = self.total_bytes
+        await self._update_status()
+
+    async def _update_status(self):
+        """Update the status message"""
+        if not self.status_message:
+            return
+
+        try:
+            if self.is_active:
+                if self.total_bytes > 0:
+                    percentage = (self.current_bytes / self.total_bytes) * 100
+                else:
+                    percentage = 0
+
+                progress_bar = create_progress_bar(percentage)
+
+                status_text = (
+                    f"{'📥' if 'Download' in self.operation else '🔄' if 'Processing' in self.operation or 'AI' in self.operation else '📤'} **{self.operation.upper()}**\n\n"
+                    f"🏷️ **File:** {self.filename[:40]}{'...' if len(self.filename) > 40 else ''}\n\n"
+                    f"{progress_bar} {percentage:.1f}%\n\n"
+                    f"📊 **Progress:** {size_unit(self.current_bytes)}"
+                )
+
+                if self.total_bytes > 0:
+                    status_text += f" / {size_unit(self.total_bytes)}"
+                else:
+                    status_text += " / Processing"
+
+                if 'AI' in self.operation or 'Transcrib' in self.operation:
+                    status_text += (
+                        f"\n🤖 **AI Model:** {model_size} on {device.upper()}\n"
+                        f"⚡ **Compute:** {compute_type}\n"
+                        f"⏳ **Please wait... AI is working!**"
+                    )
+                else:
+                    status_text += (
+                        f"\n⚡ **Speed:** {size_unit(self.speed)}/s\n"
+                        f"⏱️ **ETA:** {format_time(self.eta)}\n\n"
+                        f"⏳ **Please wait...**"
+                    )
+            else:
+                status_text = (
+                    f"✅ **{self.operation.upper()} COMPLETE!**\n\n"
+                    f"🏷️ **File:** {self.filename}\n"
+                    f"📊 **Size:** {size_unit(self.current_bytes)}\n"
+                    f"⏱️ **Time:** {format_time(time.time() - self.start_time) if self.start_time else 'Unknown'}\n\n"
+                    f"🎉 **Operation completed successfully!**"
+                )
+
+            await self.status_message.edit_text(status_text)
+
+        except Exception as e:
+            print(f"Error updating status: {str(e)}")
+
+    def set_status_message(self, message):
+        """Set the status message to update"""
+        self.status_message = message
+
+# Create directories
+os.makedirs("downloads", exist_ok=True)
+os.makedirs("uploads", exist_ok=True)
+os.makedirs("thumbnails", exist_ok=True)
+os.makedirs("audio_extracted", exist_ok=True)
+os.makedirs("transcriptions", exist_ok=True)
+
+# Initialize bot
+app = Client(
+    "colab_download_upload_bot",
+    api_id=int(API_ID),
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
+
+# Mount Google Drive
+print("🔗 Mounting Google Drive...")
+drive.mount('/content/drive', force_remount=True)
+DRIVE_PATH = f"/content/drive/MyDrive/{GDRIVE_FOLDER_NAME}/"
+CONTENT_PATH = "/content/"
+os.makedirs(DRIVE_PATH, exist_ok=True)
+print(f"✅ Google Drive mounted! Files can be stored in:")
+print(f"   📁 Google Drive: {DRIVE_PATH}")
+print(f"   💻 Colab Storage: {CONTENT_PATH}")
+
+# Initialize Enhanced Whisper model
+whisper_model = None
+if whisper_available:
+    try:
+        print(f"🔄 Loading enhanced Whisper model: {model_size} on {device}...")
+        whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        print(f"✅ Enhanced Whisper model {model_size} loaded successfully!")
+        print(f"   🎯 Device: {device.upper()}")
+        print(f"   ⚡ Compute Type: {compute_type}")
+        print(f"   🔊 VAD Filter: {'Enabled' if vad_filter else 'Disabled'}")
+    except Exception as e:
+        print(f"❌ Failed to load Whisper model: {e}")
+        # Fallback to CPU/base model
+        try:
+            print("🔄 Falling back to base model on CPU...")
+            whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+            print("✅ Fallback Whisper model loaded!")
+        except:
+            whisper_available = False
+
+# Global progress tracker and user states
+tracker = DownloadUploadTracker()
+user_download_mode = {}  # Track which location each user wants to download to
+
+def get_location_path(location):
+    """Get the appropriate path based on location"""
+    if location == "content":
+        return CONTENT_PATH
+    else:
+        return DRIVE_PATH
+
+def list_location_files(location):
+    """List files in specified location"""
+    base_path = get_location_path(location)
+    files_list = []
+    total_size = 0
+    
+    try:
+        if location == "content":
+            # For /content/, list files but exclude system directories
+            for item in Path(base_path).rglob("*"):
+                if item.is_file() and not any(x in str(item) for x in ['/.', '__pycache__', '.ipynb_checkpoints', 'sample_data']):
+                    try:
+                        file_size = item.stat().st_size
+                        total_size += file_size
+                        relative_path = item.relative_to(base_path)
+                        files_list.append((str(relative_path), file_size))
+                    except:
+                        continue
+        else:
+            # For Google Drive, list all files
+            for item in Path(base_path).rglob("*"):
+                if item.is_file():
+                    file_size = item.stat().st_size
+                    total_size += file_size
+                    relative_path = item.relative_to(base_path)
+                    files_list.append((str(relative_path), file_size))
+    except Exception as e:
+        print(f"Error listing files: {e}")
+    
+    return files_list, total_size
+
+@app.on_message(filters.command("start"))
+async def start_command(client, message):
+    """Start command handler"""
+    welcome_text = (
+        "🤖 **Google Colab Download/Upload Bot (Enhanced with Pro AI)**\n\n"
+        "**📍 Storage Locations:**\n"
+        "• 🌟 **Google Drive** - Persistent storage\n"
+        "• 💻 **Colab Storage** - Temporary /content/ folder\n\n"
+        "**📥 Download Commands:**\n"
+        "• `/download_drive` - Set mode to save files to Google Drive\n"
+        "• `/download_content` - Set mode to save files to /content/\n\n"
+        "**📤 Upload Commands:**\n"
+        "• `/upload_drive <filename>` - Upload from Google Drive\n"
+        "• `/upload_content <filename>` - Upload from /content/\n\n"
+        "**🎵 Pro Audio Extraction & AI Transcription:**\n"
+        "• `/extract_audio <video_filename>` - Extract audio as audio.mp3\n"
+        "• `/transcribe <audio_filename>` - Generate SRT subtitles with Pro AI\n"
+        "• `/extract_and_transcribe <video_filename>` - Complete workflow!\n\n"
+        "**📋 Management Commands:**\n"
+        "• `/list_drive` - List Google Drive files\n"
+        "• `/list_content` - List /content/ files\n"
+        "• `/stats` - Show storage statistics for both locations\n"
+        "• `/delete_drive <filename>` - Delete from Google Drive\n"
+        "• `/delete_content <filename>` - Delete from /content/\n\n"
+        "**🎥 Enhanced Video Features:**\n"
+        "• Smart thumbnail generation for videos\n"
+        "• Videos upload with colorful thumbnails\n"
+        f"• Pro AI Transcription: {'✅ ' + model_size + ' on ' + device.upper() if whisper_available else '❌ Not Available'}"
+    )
+    
+    await message.reply_text(welcome_text)
+
+@app.on_message(filters.command(["help", "download_drive", "download_content"]))
+async def download_commands(client, message):
+    """Handle download commands"""
+    command = message.command[0]
+    user_id = message.from_user.id
+    
+    if command == "help":
+        await start_command(client, message)
+    elif command == "download_drive":
+        user_download_mode[user_id] = "drive"
+        await message.reply_text(
+            "📥 **Download to Google Drive Mode Activated**\n\n"
+            "Send me any file and I'll save it to your Google Drive!\n\n"
+            f"📍 Files will be saved to: `{GDRIVE_FOLDER_NAME}/`\n\n"
+            "**Features:**\n"
+            "• Persistent storage (keeps files between sessions)\n"
+            "• Accessible from any Colab session\n"
+            "• Automatic duplicate name handling"
+        )
+    elif command == "download_content":
+        user_download_mode[user_id] = "content"
+        await message.reply_text(
+            "📥 **Download to /content/ Mode Activated**\n\n"
+            "Send me any file and I'll save it to /content/!\n\n"
+            "📍 Files will be saved to: `/content/`\n\n"
+            "**Features:**\n"
+            "• Fast local storage\n"
+            "• Temporary (lost when session ends)\n"
+            "• Perfect for processing workflows\n"
+            "• Direct access for other Colab operations\n"
+            f"• **🎯 Pro AI transcription with {model_size} available!**"
+        )
+
+@app.on_message(filters.command(["extract_audio"]))
+async def extract_audio_command(client, message):
+    """Extract audio from video in /content/"""
+    try:
+        if len(message.command) < 2:
+            await message.reply_text(
+                "🎵 **Extract Audio Command**\n\n"
+                "**Usage:** `/extract_audio <video_filename>`\n"
+                "**Example:** `/extract_audio myvideo.mp4`\n\n"
+                "This will create `audio.mp3` in /content/\n"
+                "Use `/list_content` to see available video files."
+            )
+            return
+            
+        video_filename = " ".join(message.command[1:])
+        video_path = Path(CONTENT_PATH) / video_filename
+        
+        if not video_path.exists():
+            await message.reply_text(f"❌ Video file `{video_filename}` not found in /content/.")
+            return
+            
+        # Start processing
+        status_msg = await message.reply_text("🎵 Starting audio extraction...")
+        
+        # Extract audio to audio.mp3
+        audio_path = Path(CONTENT_PATH) / "audio.mp3"
+        
+        if extract_audio_from_video(video_path, audio_path):
+            await status_msg.edit_text(
+                f"✅ **Audio Extraction Complete!**\n\n"
+                f"🎥 **Video:** `{video_filename}`\n"
+                f"🎵 **Audio:** `audio.mp3`\n"
+                f"📍 **Location:** /content/\n\n"
+                f"💡 **Next Steps:**\n"
+                f"• Use `/transcribe audio.mp3` - Pro AI transcription with {model_size}\n"
+                f"• Use `/upload_content audio.mp3` to download the audio"
+            )
+        else:
+            await status_msg.edit_text("❌ Audio extraction failed!")
+            
+    except Exception as e:
+        await message.reply_text(f"❌ Audio extraction error: {str(e)}")
+
+@app.on_message(filters.command(["transcribe"]))
+async def transcribe_command(client, message):
+    """Transcribe audio file and generate SRT using enhanced Whisper"""
+    try:
+        if not whisper_available or whisper_model is None:
+            await message.reply_text("❌ Pro AI transcription not available!")
+            return
+            
+        if len(message.command) < 2:
+            await message.reply_text(
+                f"🤖 **Pro AI Transcription Command ({model_size})**\n\n"
+                "**Usage:** `/transcribe <audio_filename>`\n"
+                "**Example:** `/transcribe audio.mp3`\n\n"
+                f"This will generate SRT subtitle file using {model_size} on {device.upper()}.\n"
+                "Use `/list_content` to see available audio files."
+            )
+            return
+            
+        audio_filename = " ".join(message.command[1:])
+        audio_path = Path(CONTENT_PATH) / audio_filename
+        
+        if not audio_path.exists():
+            await message.reply_text(f"❌ Audio file `{audio_filename}` not found in /content/.")
+            return
+            
+        # Start Pro AI transcription
+        file_size = audio_path.stat().st_size
+        tracker.start_operation(audio_filename, file_size, f"AI Transcribing with {model_size}")
+        status_msg = await message.reply_text(f"🤖 Starting Pro AI transcription with {model_size}...")
+        tracker.set_status_message(status_msg)
+        
+        try:
+            # Your exact transcription code with enhanced settings
+            filename = str(audio_path)
+            transcribed_srt_name = str(Path(CONTENT_PATH) / f"{Path(audio_filename).stem}.srt")
+            
+            # Enhanced transcription using your exact code
+            segments, info = whisper_model.transcribe(filename,
+                                              beam_size=beam_size,
+                                              word_timestamps=True,
+                                              vad_filter=vad_filter,
+                                              vad_parameters={'threshold': threshold,
+                                                              'min_speech_duration_ms': min_speech_duration_ms,
+                                                              'max_speech_duration_s': max_speech_duration_s,
+                                                              'min_silence_duration_ms': min_silence_duration_ms,
+                                                              'window_size_samples': window_size_samples,
+                                                              'speech_pad_ms': speech_pad_ms},
+                                              )
+            
+            if whisper_debug:
+                print("Detected language '%s' with probability %f" % (info.language, info.language_probability))
+            
+            segments = [i for i in segments]  # force run generator
+            
+            await status_msg.edit_text(f"🔄 Processing with {model_size} AI... Generating SRT...")
+            
+            # Your exact SRT generation code
+            if use_whisper_sentence_segment:
+                result_srt_list = []
+                for i, v in enumerate(segments):
+                    result_srt_list.append(srt.Subtitle(index=i,
+                                                    start=timedelta(seconds=v.start),
+                                                    end=timedelta(seconds=v.end),
+                                                    content=v.text.strip()))
+            else:
+                segments_lst = []
+                for i in segments:
+                    for j in i.words:
+                        if j.word.strip():  # not empty string
+                            segments_lst.append({"text": j.word.strip(), "start": j.start, "end": j.end})
+
+                result_merged = sentence_segments_merger(segments_lst,
+                                                         max_text_len=max_text_len,
+                                                         max_segment_interval=max_segment_interval)
+
+                result_srt_list = []
+                for i, v in enumerate(result_merged):
+                    result_srt_list.append(srt.Subtitle(index=i,
+                                                        start=timedelta(seconds=v['start']),
+                                                        end=timedelta(seconds=v['end']),
+                                                        content=v['text'].strip()))
+
+            composed_transcription = srt.compose(result_srt_list)
+
+            with open(transcribed_srt_name, 'w') as f:
+                f.write(composed_transcription)
+            
+            await tracker.complete_operation(success=True)
+            
+            await status_msg.edit_text(
+                f"✅ **Pro AI Transcription Complete!**\n\n"
+                f"🎵 **Audio:** `{audio_filename}`\n"
+                f"📝 **Subtitles:** `{Path(audio_filename).stem}.srt`\n"
+                f"🤖 **AI Model:** {model_size} on {device.upper()}\n"
+                f"🌐 **Language:** {info.language} ({info.language_probability:.2%} confidence)\n"
+                f"📊 **Segments:** {len(result_srt_list)} subtitle entries\n"
+                f"📍 **Location:** /content/\n\n"
+                f"💡 **Next Steps:**\n"
+                f"• Use `/upload_content {Path(audio_filename).stem}.srt` to download subtitles\n"
+                f"• Pro AI transcription completed with enhanced accuracy!"
+            )
+            
+        except Exception as transcribe_error:
+            await tracker.complete_operation(success=False)
+            await status_msg.edit_text(f"❌ Pro AI transcription failed: {str(transcribe_error)}")
+            
+    except Exception as e:
+        await message.reply_text(f"❌ Transcription error: {str(e)}")
+
+@app.on_message(filters.command(["extract_and_transcribe"]))
+async def extract_and_transcribe_command(client, message):
+    """Extract audio and transcribe in one command with Pro AI"""
+    try:
+        if not whisper_available or whisper_model is None:
+            await message.reply_text("❌ Pro AI transcription not available!")
+            return
+            
+        if len(message.command) < 2:
+            await message.reply_text(
+                f"🎬 **Complete Audio Extraction & Pro AI Transcription**\n\n"
+                "**Usage:** `/extract_and_transcribe <video_filename>`\n"
+                "**Example:** `/extract_and_transcribe myvideo.mp4`\n\n"
+                "**This will:**\n"
+                "1. Extract audio as audio.mp3\n"
+                f"2. Generate SRT subtitles using {model_size} AI on {device.upper()}\n\n"
+                "Use `/list_content` to see available video files."
+            )
+            return
+            
+        video_filename = " ".join(message.command[1:])
+        video_path = Path(CONTENT_PATH) / video_filename
+        
+        if not video_path.exists():
+            await message.reply_text(f"❌ Video file `{video_filename}` not found in /content/.")
+            return
+            
+        # Start complete processing
+        file_size = video_path.stat().st_size
+        tracker.start_operation(video_filename, file_size, f"Complete Processing with {model_size} AI")
+        status_msg = await message.reply_text(f"🎬 Starting complete extraction & {model_size} AI transcription...")
+        tracker.set_status_message(status_msg)
+        
+        # Step 1: Extract audio
+        audio_path = Path(CONTENT_PATH) / "audio.mp3"
+        
+        if not extract_audio_from_video(video_path, audio_path):
+            await status_msg.edit_text("❌ Audio extraction failed!")
+            return
+            
+        await status_msg.edit_text("🎵 Audio extracted! Starting Pro AI transcription...")
+        
+        # Step 2: Pro AI Transcribe
+        try:
+            filename = str(audio_path)
+            transcribed_srt_name = str(Path(CONTENT_PATH) / f"{Path(video_filename).stem}.srt")
+            
+            # Enhanced transcription using your exact code
+            segments, info = whisper_model.transcribe(filename,
+                                              beam_size=beam_size,
+                                              word_timestamps=True,
+                                              vad_filter=vad_filter,
+                                              vad_parameters={'threshold': threshold,
+                                                              'min_speech_duration_ms': min_speech_duration_ms,
+                                                              'max_speech_duration_s': max_speech_duration_s,
+                                                              'min_silence_duration_ms': min_silence_duration_ms,
+                                                              'window_size_samples': window_size_samples,
+                                                              'speech_pad_ms': speech_pad_ms},
+                                              )
+            
+            if whisper_debug:
+                print("Detected language '%s' with probability %f" % (info.language, info.language_probability))
+            
+            segments = [i for i in segments]  # force run generator
+            
+            await status_msg.edit_text(f"🔄 Generating SRT with {model_size} AI...")
+            
+            # Your exact SRT generation code
+            if use_whisper_sentence_segment:
+                result_srt_list = []
+                for i, v in enumerate(segments):
+                    result_srt_list.append(srt.Subtitle(index=i,
+                                                    start=timedelta(seconds=v.start),
+                                                    end=timedelta(seconds=v.end),
+                                                    content=v.text.strip()))
+            else:
+                segments_lst = []
+                for i in segments:
+                    for j in i.words:
+                        if j.word.strip():  # not empty string
+                            segments_lst.append({"text": j.word.strip(), "start": j.start, "end": j.end})
+
+                result_merged = sentence_segments_merger(segments_lst,
+                                                         max_text_len=max_text_len,
+                                                         max_segment_interval=max_segment_interval)
+
+                result_srt_list = []
+                for i, v in enumerate(result_merged):
+                    result_srt_list.append(srt.Subtitle(index=i,
+                                                        start=timedelta(seconds=v['start']),
+                                                        end=timedelta(seconds=v['end']),
+                                                        content=v['text'].strip()))
+
+            composed_transcription = srt.compose(result_srt_list)
+
+            with open(transcribed_srt_name, 'w') as f:
+                f.write(composed_transcription)
+            
+            await tracker.complete_operation(success=True)
+            
+            await status_msg.edit_text(
+                f"✅ **Complete Audio Extraction & Pro AI Transcription Done!**\n\n"
+                f"🎥 **Original Video:** `{video_filename}`\n"
+                f"🎵 **Extracted Audio:** `audio.mp3`\n"
+                f"📝 **Generated Subtitles:** `{Path(video_filename).stem}.srt`\n"
+                f"🤖 **AI Model:** {model_size} on {device.upper()}\n"
+                f"🌐 **Detected Language:** {info.language} ({info.language_probability:.2%} confidence)\n"
+                f"📊 **Subtitle Segments:** {len(result_srt_list)} entries\n"
+                f"📍 **Location:** /content/\n\n"
+                f"💡 **Available Files:**\n"
+                f"• Original video: `{video_filename}`\n"
+                f"• Extracted audio: `audio.mp3`\n"
+                f"• AI-generated subtitles: `{Path(video_filename).stem}.srt`\n\n"
+                f"🚀 **Next Steps:**\n"
+                f"• Use `/upload_content {Path(video_filename).stem}.srt` to download subtitles\n"
+                f"• Use `/upload_content audio.mp3` to download audio\n"
+                f"• Pro AI processing complete with {model_size}!"
+            )
+            
+        except Exception as transcribe_error:
+            await tracker.complete_operation(success=False)
+            await status_msg.edit_text(f"❌ Pro AI transcription failed: {str(transcribe_error)}")
+            
+    except Exception as e:
+        await message.reply_text(f"❌ Extract and transcribe error: {str(e)}")
+
+@app.on_message(filters.command(["list_drive", "list_content"]))
+async def list_commands(client, message):
+    """Handle list commands"""
+    command = message.command[0]
+    location = "drive" if "drive" in command else "content"
+    
+    try:
+        files_list, total_size = list_location_files(location)
+        
+        if not files_list:
+            location_name = "Google Drive" if location == "drive" else "/content/"
+            await message.reply_text(f"📂 No files found in {location_name}.")
+            return
+            
+        # Show first 25 files to avoid message length limit
+        files_display = [f"📄 `{fname}` ({size_unit(fsize)})" for fname, fsize in files_list[:25]]
+        location_name = "Google Drive" if location == "drive" else "Colab Storage (/content/)"
+        
+        file_text = (
+            f"📋 **Files in {location_name} ({len(files_list)} total):**\n"
+            f"💾 **Total Size:** {size_unit(total_size)}\n\n" +
+            "\n".join(files_display)
+        )
+        
+        if len(files_list) > 25:
+            file_text += f"\n\n... and {len(files_list) - 25} more files"
+            
+        await message.reply_text(file_text)
+        
+    except Exception as e:
+        await message.reply_text(f"❌ Error listing files: {str(e)}")
+
+@app.on_message(filters.command("stats"))
+async def stats_command(client, message):
+    """Show storage statistics for both locations"""
+    try:
+        # Get Drive stats
+        drive_files, drive_size = list_location_files("drive")
+        
+        # Get Content stats
+        content_files, content_size = list_location_files("content")
+        
+        stats_text = (
+            "📊 **Storage Statistics**\n\n"
+            f"🌟 **Google Drive ({GDRIVE_FOLDER_NAME}):**\n"
+            f"• Files: `{len(drive_files)}` files\n"
+            f"• Size: `{size_unit(drive_size)}`\n\n"
+            f"💻 **Colab Storage (/content/):**\n"
+            f"• Files: `{len(content_files)}` files\n"
+            f"• Size: `{size_unit(content_size)}`\n\n"
+            f"📁 **Total Files:** {len(drive_files) + len(content_files)}\n"
+            f"💾 **Total Size:** {size_unit(drive_size + content_size)}\n\n"
+            f"🤖 **Pro AI Features:**\n"
+            f"• Whisper Model: {'✅ ' + model_size + ' on ' + device.upper() if whisper_available else '❌ Unavailable'}\n"
+            f"• Audio Extraction: ✅ FFmpeg Available\n"
+            f"• Video Thumbnails: ✅ Available\n"
+            f"• Compute Type: {compute_type}\n"
+            f"• VAD Filter: {'✅ Enabled' if vad_filter else '❌ Disabled'}"
+        )
+        
+        await message.reply_text(stats_text)
+        
+    except Exception as e:
+        await message.reply_text(f"❌ Error getting stats: {str(e)}")
+
+@app.on_message(filters.command(["upload_drive", "upload_content", "upload_doc"]))
+async def upload_commands(client, message):
+    """Handle upload commands"""
+    command = message.command[0]
+    location = "drive" if "drive" in command else "content"
+    upload_as_doc = "doc" in command
+    
+    try:
+        if len(message.command) < 2:
+            location_name = "Google Drive" if location == "drive" else "/content/"
+            await message.reply_text(
+                f"📤 **Upload from {location_name}**\n\n"
+                f"**Usage:** `/{command} <filename>`\n"
+                f"**Example:** `/{command} myvideo.mp4`\n\n"
+                f"Use `/list_{location}` to see available files."
+            )
+            return
+            
+        filename = " ".join(message.command[1:])
+        base_path = get_location_path(location)
+        file_path = Path(base_path) / filename
+        
+        if not file_path.exists():
+            location_name = "Google Drive" if location == "drive" else "/content/"
+            await message.reply_text(f"❌ File `{filename}` not found in {location_name}.")
+            return
+            
+        if not file_path.is_file():
+            await message.reply_text(f"❌ `{filename}` is not a file.")
+            return
+            
+        # Check file size (Telegram limit: 2GB)
+        file_size = file_path.stat().st_size
+        if file_size > 2 * 1024 * 1024 * 1024:
+            await message.reply_text(f"❌ File too large! Maximum size: 2GB\nFile size: {size_unit(file_size)}")
+            return
+            
+        await perform_upload(client, message, location, filename, file_path, file_size, upload_as_doc)
+            
+    except Exception as e:
+        await message.reply_text(f"❌ Upload command failed: {str(e)}")
+
+async def perform_upload(client, message, location, filename, file_path, file_size, upload_as_doc=False):
+    """Perform the actual upload"""
+    try:
+        # Start tracking
+        location_name = "Google Drive" if location == "drive" else "/content/"
+        tracker.start_operation(filename, file_size, f"Uploading from {location_name}")
+        status_msg = await message.reply_text("📤 Starting upload...")
+        tracker.set_status_message(status_msg)
+        
+        # Define progress callback
+        async def progress_callback(current, total):
+            await tracker.update_progress(current, total)
+        
+        file_ext = file_path.suffix.lower()
+        caption = f"📤 **{filename}**\n💾 Size: {size_unit(file_size)}\n📍 From: {location_name}"
+        
+        # Handle different file types
+        if not upload_as_doc and file_ext in ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v', '.flv']:
+            # Create thumbnail for video
+            thumbnail_path = f"thumbnails/{int(time.time())}_thumb.jpg"
+            
+            # Try to extract thumbnail from video first
+            thumb = extract_video_thumbnail(file_path, thumbnail_path)
+            
+            # If extraction fails, generate random thumbnail
+            if not thumb:
+                thumb = generate_random_thumbnail(filename, thumbnail_path)
+            
+            await client.send_video(
+                chat_id=message.chat.id,
+                video=str(file_path),
+                caption=caption,
+                thumb=thumb,
+                progress=progress_callback
+            )
+            
+            # Clean up thumbnail
+            if thumb and os.path.exists(thumb):
+                os.remove(thumb)
+                
+        elif not upload_as_doc and file_ext in ['.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac']:
+            await client.send_audio(
+                chat_id=message.chat.id,
+                audio=str(file_path),
+                caption=caption,
+                progress=progress_callback
+            )
+        elif not upload_as_doc and file_ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
+            await client.send_photo(
+                chat_id=message.chat.id,
+                photo=str(file_path),
+                caption=caption,
+                progress=progress_callback
+            )
+        else:
+            # Upload as document (default for most files or when requested)
+            await client.send_document(
+                chat_id=message.chat.id,
+                document=str(file_path),
+                caption=caption,
+                progress=progress_callback
+            )
+            
+        await tracker.complete_operation(success=True)
+        
+    except Exception as upload_error:
+        await tracker.complete_operation(success=False)
+        await message.reply_text(f"❌ Upload failed: {str(upload_error)}")
+
+@app.on_message(filters.command(["delete_drive", "delete_content"]))
+async def delete_commands(client, message):
+    """Handle delete commands"""
+    command = message.command[0]
+    location = "drive" if "drive" in command else "content"
+    
+    try:
+        if len(message.command) < 2:
+            location_name = "Google Drive" if location == "drive" else "/content/"
+            await message.reply_text(
+                f"🗑️ **Delete from {location_name}**\n\n"
+                f"**Usage:** `/{command} <filename>`\n"
+                f"**Example:** `/{command} myvideo.mp4`\n\n"
+                f"Use `/list_{location}` to see available files."
+            )
+            return
+            
+        filename = " ".join(message.command[1:])
+        base_path = get_location_path(location)
+        file_path = Path(base_path) / filename
+        
+        if not file_path.exists():
+            location_name = "Google Drive" if location == "drive" else "/content/"
+            await message.reply_text(f"❌ File `{filename}` not found in {location_name}.")
+            return
+            
+        if not file_path.is_file():
+            await message.reply_text(f"❌ `{filename}` is not a file.")
+            return
+            
+        # Delete the file
+        file_size = file_path.stat().st_size
+        file_path.unlink()
+        
+        location_name = "Google Drive" if location == "drive" else "/content/"
+        await message.reply_text(
+            f"🗑️ **File Deleted Successfully!**\n\n"
+            f"📄 **File:** `{filename}`\n"
+            f"📦 **Size:** `{size_unit(file_size)}`\n"
+            f"📍 **Location:** {location_name}"
+        )
+        
+    except Exception as e:
+        await message.reply_text(f"❌ Delete failed: {str(e)}")
+
+@app.on_message(filters.document | filters.video | filters.audio | filters.photo)
+async def handle_files(client, message):
+    """Handle incoming files for download using the user's selected mode"""
+    try:
+        user_id = message.from_user.id
+        
+        # Check if user has set a download mode
+        if user_id not in user_download_mode:
+            await message.reply_text(
+                "📍 **Choose Download Location First**\n\n"
+                "Please select where to save files:\n"
+                "• `/download_drive` - Save to Google Drive\n"
+                "• `/download_content` - Save to /content/\n\n"
+                "Then send your file again!"
+            )
+            return
+        
+        location = user_download_mode[user_id]
+        
+        # Get file information
+        if message.document:
+            file_obj = message.document
+            file_name = file_obj.file_name or f"document_{int(time.time())}"
+        elif message.video:
+            file_obj = message.video
+            file_name = file_obj.file_name or f"video_{int(time.time())}.mp4"
+        elif message.audio:
+            file_obj = message.audio
+            file_name = file_obj.file_name or f"audio_{int(time.time())}.mp3"
+        elif message.photo:
+            file_obj = message.photo
+            file_name = f"photo_{int(time.time())}.jpg"
+        else:
+            await message.reply_text("❌ Unsupported file type.")
+            return
+        
+        # Check file size
+        file_size = getattr(file_obj, 'file_size', 0)
+        if file_size > 2 * 1024 * 1024 * 1024:  # 2GB limit
+            await message.reply_text(f"❌ File too large! Maximum size: 2GB\nFile size: {size_unit(file_size)}")
+            return
+            
+        # Start tracking
+        location_name = "Google Drive" if location == "drive" else "/content/"
+        tracker.start_operation(file_name, file_size, f"Downloading to {location_name}")
+        status_msg = await message.reply_text("📥 Starting download...")
+        tracker.set_status_message(status_msg)
+        
+        # Define progress callback
+        async def progress_callback(current, total):
+            await tracker.update_progress(current, total)
+        
+        # Download file to temporary location
+        temp_path = f"downloads/{file_name}"
+        
+        downloaded_file = await client.download_media(
+            message,
+            file_name=temp_path,
+            progress=progress_callback
+        )
+        
+        # Move to the selected location
+        base_path = get_location_path(location)
+        final_file_path = Path(base_path) / file_name
+        counter = 1
+        original_name = file_name
+        
+        # Handle duplicate names
+        while final_file_path.exists():
+            name_part = Path(original_name).stem
+            ext_part = Path(original_name).suffix
+            file_name = f"{name_part}_{counter}{ext_part}"
+            final_file_path = Path(base_path) / file_name
+            counter += 1
+        
+        shutil.move(downloaded_file, final_file_path)
+        
+        await tracker.complete_operation(success=True)
+        
+        # Send confirmation with Pro AI features info
+        final_msg = (
+            f"✅ **Download Complete!**\n\n"
+            f"📄 **File:** `{file_name}`\n"
+            f"📦 **Size:** `{size_unit(file_size)}`\n"
+            f"📍 **Location:** {location_name}\n\n"
+        )
+        
+        if counter > 1:
+            final_msg += f"💡 **Note:** File was renamed to avoid duplicate\n\n"
+            
+        final_msg += f"🚀 **Available Actions:**\n"
+        final_msg += f"• `/upload_{location} {file_name}` - Send back to Telegram\n"
+        
+        # Add Pro AI features for videos in /content/
+        if location == "content" and file_name.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.webm', '.m4v', '.flv')) and whisper_available:
+            final_msg += f"• `/extract_audio {file_name}` - Extract audio as MP3\n"
+            final_msg += f"• `/extract_and_transcribe {file_name}` - Extract + Pro AI subtitles with {model_size}\n"
+            final_msg += f"\n🤖 **Pro AI Ready:** {model_size} on {device.upper()} for transcription!"
+            
+        await status_msg.edit_text(final_msg)
+        
+    except Exception as e:
+        await tracker.complete_operation(success=False)
+        await message.reply_text(f"❌ Download failed: {str(e)}")
+
+# Error handler for unknown commands
+@app.on_message(filters.text & filters.private)
+async def handle_other_messages(client, message):
+    """Handle unrecognized messages"""
+    if message.text and message.text.startswith('/'):
+        await message.reply_text(
+            "❓ **Unknown Command**\n\n"
+            "Use `/help` to see available commands.\n\n"
+            "**🎯 Quick Commands:**\n"
+            "• `/start` - Main menu\n"
+            "• `/download_drive` or `/download_content` - Set download location\n"
+            "• `/list_drive` or `/list_content` - Browse files\n"
+            f"• `/extract_audio <video>` - Extract audio from video\n"
+            f"• `/transcribe <audio>` - Pro AI transcription with {model_size}\n"
+            "• `/stats` - Storage statistics"
+        )
+
+# Async function to run the bot properly
+async def run_bot():
+    """Run the bot with proper async handling"""
+    print("🚀 Starting Enhanced Google Colab Download/Upload Bot...")
+    print("📱 Bot is ready to receive files!")
+    print(f"📁 Google Drive: {DRIVE_PATH}")
+    print(f"💻 Colab Storage: {CONTENT_PATH}")
+    print(f"🤖 Pro AI Transcription: {'✅ ' + model_size + ' on ' + device.upper() if whisper_available else '❌ Not Available'}")
+    print("🔗 Send /start to your bot to begin!")
+    print("=" * 70)
+    
+    await app.start()
+    print("✅ Bot started successfully!")
+    
+    # Keep the bot running
+    await asyncio.Event().wait()
+
+# Run the bot
+try:
+    asyncio.run(run_bot())
+except KeyboardInterrupt:
+    print("\n🛑 Bot stopped by user")
+except Exception as e:
+    print(f"❌ Bot error: {e}")
