@@ -29,7 +29,7 @@ max_segment_interval = 1.5  # @param {type:"number"}
 print("📦 Installing required packages...")
 # Install dependencies
 !pip install -q nest-asyncio pyrogram tgcrypto aiofiles pillow
-!pip install -q faster-whisper srt
+!pip install -q faster-whisper==0.10.0 srt
 !apt-get update &> /dev/null
 !apt-get install -y rclone ffmpeg &> /dev/null
 
