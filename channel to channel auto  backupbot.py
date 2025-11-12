@@ -4,8 +4,8 @@ import re
 import logging
 import asyncio
 
-API_TOKEN = "7502985893:AAEXdmzox8ezEpEp_Nye4Ky5jNVO8jGQ1zc"
-ADMIN_USER_ID = 1833064017  # 🔒 Replace with your Telegram user ID
+API_TOKEN = "75021zc"
+ADMIN_USER_ID = 18317  # 🔒 Replace with your Telegram user ID
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
