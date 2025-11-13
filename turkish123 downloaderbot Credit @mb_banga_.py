@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""
+Turkish123 Stream Extractor & Auto-Downloader Telegram Bot
+- Searches for dramas on Turkish123
+- Extracts m3u8 stream links using headless browser automation
+- Downloads episodes using yt-dlp
+- Uploads to Telegram channel/chat
+- Monitors for new episodes every 3 hours
+- Queue system for multiple dramas
+- Admin-only access control
+- Retry mechanism for failed episodes (up to 3 attempts)
+"""
 
 import os
 import sys
@@ -42,15 +54,18 @@ M3U8_RE = re.compile(r'https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*', re.IGNORECASE)
 # Download settings
 MIN_STORAGE_GB = 2
 MAX_FILE_SIZE_GB = 1.98
-CHUNK_DURATION_MINUTES = 45
-EDIT_SLEEP_TIME_OUT = 30
+CHUNK_DURATION_MINUTES = 60
+EDIT_SLEEP_TIME_OUT = 60
+
+# Retry settings
+MAX_EPISODE_RETRIES = 3
 
 # Telegram Configuration - REPLACE WITH YOUR VALUES
-TELEGRAM_API_ID = 2592
-TELEGRAM_API_HASH = "82066a5912a"
-TELEGRAM_BOT_TOKEN = "794220ya_E"
-TELEGRAM_CHAT_ID = -10073
-ADMIN_ID = 1817
+TELEGRAM_API_ID = 25a592
+TELEGRAM_API_HASH = "82066a558a12a"
+TELEGRAM_BOT_TOKEN = "79422adStD-oa_wYya_E"
+TELEGRAM_CHAT_ID = -100a17
+ADMIN_ID = 183a17
 
 # Progress display constants
 FINISHED_PROGRESS_STR = "█"
@@ -61,14 +76,7 @@ drama_queue = []
 monitored_dramas = {}
 active_downloads = {}
 cancelled_downloads = set()
-bot_status = {
-    "processing": False, 
-    "current_drama": None, 
-    "monitoring": True, 
-    "queue_running": False,
-    "current_episode": None,
-    "total_episodes": 0
-}
+bot_status = {"processing": False, "current_drama": None, "monitoring": True}
 
 # Thread pool executor for blocking operations
 executor = ThreadPoolExecutor(max_workers=3)
@@ -130,8 +138,7 @@ class Drama:
     total_episodes: int
     processed_episodes: int = 0
     last_check: Optional[str] = None
-    status: str = "queued"  # queued, processing, completed, monitoring, failed
-    added_date: Optional[str] = None
+    status: str = "pending"
     failed_episodes: List[int] = None
     
     def __post_init__(self):
@@ -157,7 +164,6 @@ def save_data():
         
         with open(MONITORED_FILE, 'w') as f:
             json.dump({k: v.__dict__ for k, v in monitored_dramas.items()}, f, indent=2)
-        logger.info("Data saved successfully")
     except Exception as e:
         logger.error(f"Error saving data: {e}")
 
@@ -170,13 +176,11 @@ def load_data():
             with open(QUEUE_FILE, 'r') as f:
                 data = json.load(f)
                 drama_queue = [Drama(**item) for item in data]
-                logger.info(f"Loaded {len(drama_queue)} dramas from queue")
         
         if os.path.exists(MONITORED_FILE):
             with open(MONITORED_FILE, 'r') as f:
                 data = json.load(f)
                 monitored_dramas = {k: Drama(**v) for k, v in data.items()}
-                logger.info(f"Loaded {len(monitored_dramas)} monitored dramas")
     except Exception as e:
         logger.error(f"Error loading data: {e}")
 
@@ -362,7 +366,7 @@ class Progress:
             
             tmp = (
                 progress
-                + "\n**⌧ Total 🗃:**` 〚{1}〛`\n**⌧ Done ✅ :**` 〚{0}〛`\n**⌧ Speed 📊 :** ` 〚{2}/s〛`\n**⌧ ETA 🔃 :**` 〚{3}〛`\n {4}".format(
+                + "\n**⌧ Total 🗃:** ` 『{1}』`\n**⌧ Done ✅ :**` 『{0}』`\n**⌧ Speed 📊 :** ` 『{2}/s』`\n**⌧ ETA 📃 :**` 『{3}』`\n {4}".format(
                     humanbytes(current),
                     humanbytes(total),
                     humanbytes(speed),
@@ -611,7 +615,7 @@ async def upload_to_telegram(client: Client, file_path: str, episode_name: str, 
             video=file_path,
             duration=duration,
             thumb=thumbnail_path if thumbnail_created else None,
-            caption=f"📺 **{episode_name}**",
+            caption=f"📺 @popcornweb @kdramahype  **{episode_name}**",
             progress=prog.progress_for_pyrogram,
             progress_args=(
                 f"📤 Uploading: `{os.path.basename(file_path)}`",
@@ -680,12 +684,10 @@ async def process_and_upload(client: Client, m3u8_url, episode_name, status_mess
         return False
 
 async def process_drama(drama: Drama, client: Client):
-    """Process all episodes of a drama"""
+    """Process all episodes of a drama with retry mechanism"""
     try:
-        drama.status = "processing"
         bot_status["processing"] = True
         bot_status["current_drama"] = drama.name
-        save_data()
         
         logger.info(f"Processing drama: {drama.name}")
         
@@ -699,31 +701,22 @@ async def process_drama(drama: Drama, client: Client):
         
         episodes = get_episodes_list(drama.url)
         drama.total_episodes = len(episodes)
-        bot_status["total_episodes"] = len(episodes)
-        save_data()
         
         if not episodes:
             await client.send_message(ADMIN_ID, f"❌ No episodes found for {drama.name}")
-            drama.status = "failed"
-            save_data()
             return
         
         sanitized_name = sanitize_filename(drama.name)
         
+        # Process episodes starting from where we left off
         for episode in episodes[drama.processed_episodes:]:
-            if not bot_status["queue_running"]:
-                await client.send_message(
-                    ADMIN_ID,
-                    f"⏹️ **Queue stopped by user**\n\n"
-                    f"📺 {drama.name}\n"
-                    f"📊 Progress: {drama.processed_episodes}/{drama.total_episodes} episodes"
-                )
-                break
-            
             episode_num = episode['number']
             episode_url = episode['url']
             
-            bot_status["current_episode"] = episode_num
+            # Skip if this episode has already failed all retries
+            if episode_num in drama.failed_episodes:
+                logger.info(f"Skipping episode {episode_num} - already failed all retries")
+                continue
             
             logger.info(f"Processing episode {episode_num}/{len(episodes)}")
             
@@ -734,64 +727,175 @@ async def process_drama(drama: Drama, client: Client):
                 f"🔍 Extracting stream link..."
             )
             
-            stream_links = await extract_stream_link(episode_url)
+            # Retry logic for extracting stream link
+            stream_links = None
+            for attempt in range(1, MAX_EPISODE_RETRIES + 1):
+                try:
+                    logger.info(f"Stream extraction attempt {attempt}/{MAX_EPISODE_RETRIES} for episode {episode_num}")
+                    
+                    if attempt > 1:
+                        await status_msg.edit_text(
+                            f"📺 **{drama.name}**\n"
+                            f"🎞️ Episode {episode_num}/{len(episodes)}\n"
+                            f"🔄 Stream link retry {attempt}/{MAX_EPISODE_RETRIES}\n"
+                            f"🔍 Extracting stream link..."
+                        )
+                        # Wait before retrying
+                        await asyncio.sleep(5)
+                    
+                    stream_links = await extract_stream_link(episode_url)
+                    
+                    if stream_links:
+                        logger.info(f"Successfully extracted stream link on attempt {attempt}")
+                        break
+                    else:
+                        logger.warning(f"No stream link found on attempt {attempt}")
+                        
+                        if attempt < MAX_EPISODE_RETRIES:
+                            await status_msg.edit_text(
+                                f"📺 **{drama.name}**\n"
+                                f"🎞️ Episode {episode_num}/{len(episodes)}\n"
+                                f"⚠️ Stream link attempt {attempt} failed\n"
+                                f"🔄 Retrying in 5 seconds... ({attempt}/{MAX_EPISODE_RETRIES})"
+                            )
+                
+                except Exception as e:
+                    logger.error(f"Error on stream extraction attempt {attempt} for episode {episode_num}: {e}")
+                    
+                    if attempt < MAX_EPISODE_RETRIES:
+                        await status_msg.edit_text(
+                            f"📺 **{drama.name}**\n"
+                            f"🎞️ Episode {episode_num}/{len(episodes)}\n"
+                            f"❌ Stream extraction attempt {attempt} failed: {str(e)[:50]}\n"
+                            f"🔄 Retrying in 5 seconds... ({attempt}/{MAX_EPISODE_RETRIES})"
+                        )
             
+            # Check if we got stream links after all retries
             if not stream_links:
-                await status_msg.edit_text(f"❌ No stream link found for episode {episode_num}")
+                await status_msg.edit_text(
+                    f"❌ **Stream link extraction failed**\n\n"
+                    f"📺 {drama.name}\n"
+                    f"🎞️ Episode {episode_num}/{len(episodes)}\n"
+                    f"⚠️ Failed after {MAX_EPISODE_RETRIES} attempts - Skipping episode"
+                )
+                logger.error(f"Failed to extract stream link for episode {episode_num} after {MAX_EPISODE_RETRIES} attempts")
                 drama.failed_episodes.append(episode_num)
                 save_data()
                 continue
             
             m3u8_url = stream_links[0]
             
-            success = await process_and_upload(
-                client,
-                m3u8_url,
-                f"{sanitized_name}-episode-{episode_num}",
-                status_msg
-            )
+            # Retry logic for downloading and uploading
+            success = False
+            for attempt in range(1, MAX_EPISODE_RETRIES + 1):
+                try:
+                    if attempt > 1:
+                        await status_msg.edit_text(
+                            f"📺 **{drama.name}**\n"
+                            f"🎞️ Episode {episode_num}/{len(episodes)}\n"
+                            f"🔄 Download/Upload attempt {attempt}/{MAX_EPISODE_RETRIES}"
+                        )
+                        await asyncio.sleep(3)
+                    
+                    success = await process_and_upload(
+                        client,
+                        m3u8_url,
+                        f"{sanitized_name}-episode-{episode_num}",
+                        status_msg
+                    )
+                    
+                    if success:
+                        logger.info(f"Successfully processed episode {episode_num} on attempt {attempt}")
+                        break
+                    else:
+                        logger.warning(f"Failed to process episode {episode_num} on attempt {attempt}")
+                        
+                        if attempt < MAX_EPISODE_RETRIES:
+                            await status_msg.edit_text(
+                                f"📺 **{drama.name}**\n"
+                                f"🎞️ Episode {episode_num}/{len(episodes)}\n"
+                                f"⚠️ Download/Upload attempt {attempt} failed\n"
+                                f"🔄 Retrying... ({attempt}/{MAX_EPISODE_RETRIES})"
+                            )
+                
+                except Exception as e:
+                    logger.error(f"Error processing episode {episode_num} on attempt {attempt}: {e}")
+                    
+                    if attempt < MAX_EPISODE_RETRIES:
+                        await status_msg.edit_text(
+                            f"📺 **{drama.name}**\n"
+                            f"🎞️ Episode {episode_num}/{len(episodes)}\n"
+                            f"❌ Processing attempt {attempt} failed: {str(e)[:50]}\n"
+                            f"🔄 Retrying... ({attempt}/{MAX_EPISODE_RETRIES})"
+                        )
             
             if success:
                 drama.processed_episodes = episode_num
                 save_data()
             else:
+                await status_msg.edit_text(
+                    f"❌ **Episode processing failed**\n\n"
+                    f"📺 {drama.name}\n"
+                    f"🎞️ Episode {episode_num}/{len(episodes)}\n"
+                    f"⚠️ Failed after {MAX_EPISODE_RETRIES} attempts - Skipping episode"
+                )
+                logger.error(f"Failed to process episode {episode_num} after {MAX_EPISODE_RETRIES} attempts")
                 drama.failed_episodes.append(episode_num)
                 save_data()
             
             await asyncio.sleep(3)
         
+        # Check completion status
+        successful_episodes = drama.processed_episodes
+        failed_episodes_count = len(drama.failed_episodes)
+        
         if drama.processed_episodes >= drama.total_episodes:
-            drama.status = "completed"
-            
-            # Move to monitoring
+            drama.status = "monitoring"
             monitored_dramas[drama.name] = drama
-            monitored_dramas[drama.name].status = "monitoring"
             
-            # Remove from queue
-            drama_queue[:] = [d for d in drama_queue if d.name != drama.name]
+            # Remove from queue when complete
+            if drama in drama_queue:
+                drama_queue.remove(drama)
             
-            await client.send_message(
-                ADMIN_ID,
+            completion_msg = (
                 f"🎉 **Drama Complete!**\n\n"
                 f"📺 **{drama.name}**\n"
-                f"✅ **Episodes:** {drama.processed_episodes}/{drama.total_episodes}\n"
-                f"❌ **Failed:** {len(drama.failed_episodes)} episodes\n"
-                f"📤 **Uploaded to:** Chat ID {TELEGRAM_CHAT_ID}\n"
-                f"👁️ **Added to monitoring for new episodes**"
+                f"✅ **Episodes:** {successful_episodes}/{drama.total_episodes}\n"
             )
+            
+            if failed_episodes_count > 0:
+                completion_msg += f"❌ **Failed:** {failed_episodes_count} episode(s)\n"
+                completion_msg += f"🔢 **Failed episodes:** {', '.join(map(str, drama.failed_episodes))}\n"
+            
+            completion_msg += (
+                f"📤 **Uploaded to:** Chat ID {TELEGRAM_CHAT_ID}\n"
+                f"🔄 **Now monitoring for new episodes...**"
+            )
+            
+            await client.send_message(ADMIN_ID, completion_msg)
         
         save_data()
         
     except Exception as e:
         logger.error(f"Error processing drama {drama.name}: {e}")
-        drama.status = "failed"
-        save_data()
-        await client.send_message(ADMIN_ID, f"❌ Error processing {drama.name}: {str(e)}")
+        await client.send_message(ADMIN_ID, f"❌ Error: {str(e)}")
     finally:
         bot_status["processing"] = False
         bot_status["current_drama"] = None
-        bot_status["current_episode"] = None
-        bot_status["total_episodes"] = 0
+        
+        # **KEY FIX: Process next drama in queue automatically**
+        await process_next_in_queue(client)
+
+async def process_next_in_queue(client: Client):
+    """Process the next drama in the queue"""
+    if not drama_queue or bot_status["processing"]:
+        return
+    
+    for drama in drama_queue:
+        if drama.status == "pending" or (drama.status == "processing" and drama.processed_episodes < drama.total_episodes):
+            await process_drama(drama, client)
+            break  # Only process one drama at a time
+
 
 async def check_for_new_episodes(client: Client):
     """Check monitored dramas for new episodes"""
@@ -799,9 +903,9 @@ async def check_for_new_episodes(client: Client):
         if not monitored_dramas or not bot_status["monitoring"]:
             return
         
-        logger.info("🔍 Checking for new episodes...")
+        logger.info("Checking for new episodes...")
         
-        for drama_name, drama in list(monitored_dramas.items()):
+        for drama_name, drama in monitored_dramas.items():
             try:
                 episodes = get_episodes_list(drama.url)
                 new_total = len(episodes)
@@ -811,23 +915,16 @@ async def check_for_new_episodes(client: Client):
                     
                     await client.send_message(
                         ADMIN_ID,
-                        f"🆕 **New Episodes Detected!**\n\n"
-                        f"📺 **{drama.name}**\n"
-                        f"➕ **{new_count} new episode(s)**\n"
-                        f"📊 **Total:** {new_total} episodes\n"
-                        f"📈 **Previous:** {drama.total_episodes} episodes\n\n"
-                        f"🚀 **Adding back to queue...**"
+                        f"🆕 **New Episodes!**\n\n"
+                        f"📺 {drama.name}\n"
+                        f"➕ {new_count} new episode(s)\n"
+                        f"📊 Total: {new_total}\n\n"
+                        f"🚀 Starting download..."
                     )
                     
-                    # Update drama and add back to queue
                     drama.total_episodes = new_total
-                    drama.status = "queued"
-                    
-                    # Remove from monitored and add to queue
-                    del monitored_dramas[drama_name]
-                    drama_queue.append(drama)
-                    
-                    logger.info(f"Added {drama.name} back to queue - {new_count} new episodes")
+                    drama.status = "processing"
+                    await process_drama(drama, client)
                 
                 drama.last_check = datetime.now().isoformat()
                 
@@ -861,276 +958,108 @@ def admin_only(func):
 async def start_command(client: Client, message: Message):
     """Start command handler"""
     await message.reply_text(
-        f"🎬 **Turkish123 Drama Bot - Improved Queue System**\n\n"
+        f"🎬 **Turkish123 Drama Bot**\n\n"
         f"**Upload Destination:** Chat ID `{TELEGRAM_CHAT_ID}`\n\n"
-        f"**📋 Queue System:**\n"
-        f"• `/search <query>` - Search and add dramas\n"
-        f"• `/queue` - View queue\n"
-        f"• `/go` - Start processing ALL queued dramas\n"
-        f"• `/stop` - Stop processing\n"
-        f"• `/clear` - Clear entire queue\n\n"
-        f"**👁️ Monitoring:**\n"
+        f"**Available commands:**\n"
+        f"• `/search <query>` - Search for dramas\n"
+        f"• `/queue` - View current queue\n"
+        f"• `/status` - Check bot status\n"
         f"• `/monitored` - View monitored dramas\n"
-        f"• `/toggle_monitoring` - Enable/disable\n\n"
-        f"**📊 Status:**\n"
-        f"• `/status` - Check bot status\n\n"
-        f"**How it works:**\n"
-        f"1️⃣ Use `/search` to find and add dramas to queue\n"
-        f"2️⃣ Keep searching and adding more dramas\n"
-        f"3️⃣ When ready, use `/go` to process everything\n"
-        f"4️⃣ Bot processes all dramas one by one\n"
-        f"5️⃣ Completed dramas auto-monitored for new episodes"
+        f"• `/toggle_monitoring` - Toggle auto-monitoring\n"
+        f"• `/retry_failed` - Retry failed episodes\n\n"
+        f"**Features:**\n"
+        f"✨ Auto-extracts stream links\n"
+        f"⬇️ Downloads episodes automatically\n"
+        f"📤 Uploads to Telegram\n"
+        f"🔄 Monitors for new episodes every 3 hours\n"
+        f"📋 Queue system for multiple dramas\n"
+        f"🔁 Retry failed episodes up to {MAX_EPISODE_RETRIES} times"
     )
 
 @app.on_message(filters.command("search") & filters.private)
 @admin_only
 async def search_command(client: Client, message: Message):
-    """Search command handler - adds to queue"""
+    """Search command handler"""
     try:
         command_parts = message.text.split(' ', 1)
         if len(command_parts) < 2:
-            await message.reply_text(
-                "❌ **Please provide a search query**\n\n"
-                "**Usage:** `/search drama name`\n\n"
-                "**Example:** `/search love is in the air`"
-            )
+            await message.reply_text("❌ Please provide a search query.\n\nUsage: `/search drama name`")
             return
         
         query = command_parts[1].strip()
-        status_msg = await message.reply_text(f"🔍 **Searching for:** `{query}`\n\n⏳ Please wait...")
+        status_msg = await message.reply_text(f"🔍 Searching for '{query}'...")
         
         results = search_movies(query)
         
         if not results:
-            await status_msg.edit_text(f"❌ **No results found for:** `{query}`\n\nTry a different search term.")
+            await status_msg.edit_text(f"❌ No results found for '{query}'")
             return
         
         keyboard = []
-        for i, result in enumerate(results[:10], 1):
-            # Check if already added
-            already_added = any(d.name == result['name'] for d in drama_queue)
-            already_monitored = result['name'] in monitored_dramas
-            
-            button_text = result['name'][:45]
-            if already_added:
-                button_text = f"✅ {button_text}"
-            elif already_monitored:
-                button_text = f"👁️ {button_text}"
-            
+        for i, result in enumerate(results[:10]):
             keyboard.append([
                 InlineKeyboardButton(
-                    f"{i}. {button_text}",
-                    callback_data=f"add_drama_{i-1}"
+                    f"{i+1}. {result['name'][:50]}",
+                    callback_data=f"select_drama_{i}"
                 )
             ])
         
-        # Store search results temporarily
         app.search_results = results
         
         await status_msg.edit_text(
-            f"🔍 **Search Results for:** `{query}`\n\n"
-            f"**Found {len(results)} drama(s)**\n\n"
-            f"**Select dramas to add to queue:**\n"
-            f"✅ = Already in queue\n"
-            f"👁️ = Already monitored\n\n"
-            f"💡 **Tip:** You can add multiple dramas, then use `/go` to process all!",
+            f"🔍 **Search Results for '{query}'**\n\n"
+            f"Found {len(results)} drama(s). Select one:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
     except Exception as e:
         logger.error(f"Search error: {e}")
-        await message.reply_text(f"❌ **Error:** {str(e)}")
+        await message.reply_text(f"❌ Error: {str(e)}")
 
 @app.on_message(filters.command("queue") & filters.private)
 @admin_only
 async def queue_command(client: Client, message: Message):
-    """View queue with management options"""
+    """Queue command handler"""
     if not drama_queue:
-        await message.reply_text(
-            "📋 **Queue is empty**\n\n"
-            "Use `/search <drama name>` to add dramas to the queue.\n\n"
-            "**Example:** `/search sen cal kapimi`"
-        )
+        await message.reply_text("📋 Queue is empty.")
         return
     
-    queue_text = f"📋 **Queue - {len(drama_queue)} Drama(s)**\n\n"
-    
-    keyboard = []
+    queue_text = "📋 **Current Queue:**\n\n"
     for i, drama in enumerate(drama_queue, 1):
         status_emoji = {
-            "queued": "⏳",
+            "pending": "⏳",
             "processing": "🔄",
             "completed": "✅",
-            "failed": "❌"
+            "monitoring": "👁️"
         }.get(drama.status, "❓")
         
         queue_text += (
             f"{i}. {status_emoji} **{drama.name}**\n"
-            f"   📊 Progress: {drama.processed_episodes}/{drama.total_episodes or '?'} episodes\n"
-            f"   📅 Status: {drama.status.title()}\n"
+            f"   📊 Episodes: {drama.processed_episodes}/{drama.total_episodes}\n"
+            f"   📅 Status: {drama.status}\n"
         )
         
         if drama.failed_episodes:
-            queue_text += f"   ❌ Failed: {len(drama.failed_episodes)} episodes\n"
+            queue_text += f"   ❌ Failed: {len(drama.failed_episodes)} episode(s)\n"
         
         queue_text += "\n"
-        
-        # Add remove button if not currently processing
-        if drama.status != "processing":
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🗑️ Remove: {drama.name[:30]}",
-                    callback_data=f"remove_drama_{i-1}"
-                )
-            ])
     
-    # Add control buttons
-    control_buttons = []
-    
-    if not bot_status["queue_running"]:
-        control_buttons.append(
-            InlineKeyboardButton("🚀 Start All (/go)", callback_data="start_all")
-        )
-    else:
-        control_buttons.append(
-            InlineKeyboardButton("⏹️ Stop Queue", callback_data="stop_all")
-        )
-    
-    if len(drama_queue) > 0 and not bot_status["processing"]:
-        control_buttons.append(
-            InlineKeyboardButton("🗑️ Clear All", callback_data="clear_all")
-        )
-    
-    if control_buttons:
-        keyboard.append(control_buttons)
-    
-    queue_text += f"\n**Status:** {'🔄 Processing' if bot_status['queue_running'] else '⏸️ Ready to start'}"
-    
-    if bot_status["current_drama"]:
-        queue_text += f"\n**Current:** {bot_status['current_drama']}"
-        if bot_status["current_episode"]:
-            queue_text += f" (Ep {bot_status['current_episode']}/{bot_status['total_episodes']})"
-    
-    await message.reply_text(queue_text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
-
-@app.on_message(filters.command("go") & filters.private)
-@admin_only
-async def go_command(client: Client, message: Message):
-    """Start processing all queued dramas"""
-    if bot_status["processing"] or bot_status["queue_running"]:
-        await message.reply_text(
-            "⚠️ **Already processing!**\n\n"
-            f"Current drama: {bot_status['current_drama']}\n"
-            f"Use `/stop` to stop processing."
-        )
-        return
-    
-    if not drama_queue:
-        await message.reply_text(
-            "📋 **Queue is empty!**\n\n"
-            "Add dramas using `/search <drama name>` first."
-        )
-        return
-    
-    bot_status["queue_running"] = True
-    save_data()
-    
-    # Count total episodes
-    total_dramas = len(drama_queue)
-    queued_dramas = [d for d in drama_queue if d.status == "queued"]
-    
-    await message.reply_text(
-        f"🚀 **Queue Processing Started!**\n\n"
-        f"📋 **Total dramas:** {total_dramas}\n"
-        f"⏳ **Queued:** {len(queued_dramas)}\n"
-        f"📤 **Upload to:** Chat ID `{TELEGRAM_CHAT_ID}`\n\n"
-        f"🔄 **Processing will begin shortly...**\n"
-        f"⏹️ **Use `/stop` to stop at any time**"
-    )
-    
-    # Start processing in background
-    asyncio.create_task(process_all_dramas(client))
-
-@app.on_message(filters.command("stop") & filters.private)
-@admin_only
-async def stop_command(client: Client, message: Message):
-    """Stop processing queue"""
-    if not bot_status["queue_running"]:
-        await message.reply_text("⚠️ **Queue is not running.**")
-        return
-    
-    bot_status["queue_running"] = False
-    save_data()
-    
-    await message.reply_text(
-        f"⏹️ **Queue Processing Stopped!**\n\n"
-        f"⚠️ **Current episode will finish, then stop.**\n"
-        f"📊 **Progress saved automatically**\n\n"
-        f"Use `/go` to resume processing."
-    )
-
-@app.on_message(filters.command("clear") & filters.private)
-@admin_only
-async def clear_command(client: Client, message: Message):
-    """Clear the entire queue"""
-    if bot_status["processing"]:
-        await message.reply_text(
-            "⚠️ **Cannot clear while processing!**\n\n"
-            "Use `/stop` first, then try again."
-        )
-        return
-    
-    if not drama_queue:
-        await message.reply_text("📋 **Queue is already empty.**")
-        return
-    
-    count = len(drama_queue)
-    drama_queue.clear()
-    save_data()
-    
-    await message.reply_text(
-        f"🗑️ **Queue Cleared!**\n\n"
-        f"Removed {count} drama(s) from queue."
-    )
+    await message.reply_text(queue_text)
 
 @app.on_message(filters.command("status") & filters.private)
 @admin_only
 async def status_command(client: Client, message: Message):
-    """Detailed bot status"""
-    free_space = get_free_space_gb()
-    
+    """Status command handler"""
     status_text = (
-        f"🤖 **Bot Status Dashboard**\n\n"
-        f"**📤 Upload Destination**\n"
-        f"└ Chat ID: `{TELEGRAM_CHAT_ID}`\n\n"
-        f"**📋 Queue Status**\n"
-        f"└ Dramas in queue: {len(drama_queue)}\n"
-        f"└ Queue running: {'✅ Yes' if bot_status['queue_running'] else '❌ No'}\n"
-        f"└ Currently processing: {'✅ Yes' if bot_status['processing'] else '❌ No'}\n\n"
-    )
-    
-    if bot_status["current_drama"]:
-        status_text += (
-            f"**🔄 Current Processing**\n"
-            f"└ Drama: {bot_status['current_drama']}\n"
-        )
-        if bot_status["current_episode"]:
-            status_text += f"└ Episode: {bot_status['current_episode']}/{bot_status['total_episodes']}\n"
-        status_text += "\n"
-    
-    status_text += (
-        f"**👁️ Monitoring**\n"
-        f"└ Status: {'✅ Enabled' if bot_status['monitoring'] else '❌ Disabled'}\n"
-        f"└ Monitored dramas: {len(monitored_dramas)}\n\n"
-        f"**💾 System**\n"
-        f"└ Free space: {free_space:.2f} GB\n"
-        f"└ Min required: {MIN_STORAGE_GB} GB\n"
-        f"└ Max file size: {MAX_FILE_SIZE_GB} GB\n\n"
-        f"**Commands:**\n"
-        f"• `/search` - Add dramas\n"
-        f"• `/queue` - View queue\n"
-        f"• `/go` - Start processing\n"
-        f"• `/stop` - Stop processing"
+        f"🤖 **Bot Status**\n\n"
+        f"📤 **Upload to:** Chat ID `{TELEGRAM_CHAT_ID}`\n"
+        f"🔄 **Processing:** {'Yes' if bot_status['processing'] else 'No'}\n"
+        f"📺 **Current:** {bot_status['current_drama'] or 'None'}\n"
+        f"👁️ **Monitoring:** {'Enabled' if bot_status['monitoring'] else 'Disabled'}\n"
+        f"📋 **Queue:** {len(drama_queue)}\n"
+        f"🎭 **Monitored:** {len(monitored_dramas)}\n"
+        f"💾 **Free Space:** {get_free_space_gb():.2f} GB\n"
+        f"🔁 **Max Retries:** {MAX_EPISODE_RETRIES}"
     )
     
     await message.reply_text(status_text)
@@ -1138,343 +1067,213 @@ async def status_command(client: Client, message: Message):
 @app.on_message(filters.command("monitored") & filters.private)
 @admin_only
 async def monitored_command(client: Client, message: Message):
-    """View monitored dramas"""
+    """Monitored dramas command handler"""
     if not monitored_dramas:
-        await message.reply_text(
-            "👁️ **No dramas being monitored**\n\n"
-            "Complete a drama to start auto-monitoring for new episodes."
-        )
+        await message.reply_text("👁️ No dramas are being monitored.")
         return
     
-    monitored_text = f"👁️ **Monitored Dramas - {len(monitored_dramas)}**\n\n"
-    keyboard = []
-    
+    monitored_text = "👁️ **Monitored Dramas:**\n\n"
     for name, drama in monitored_dramas.items():
         last_check = drama.last_check or "Never"
         if drama.last_check:
             try:
-                check_time = datetime.fromisoformat(drama.last_check)
-                last_check = check_time.strftime("%m/%d %H:%M")
+                last_check = datetime.fromisoformat(drama.last_check).strftime("%Y-%m-%d %H:%M")
             except:
                 pass
         
         monitored_text += (
             f"📺 **{name}**\n"
             f"   📊 Episodes: {drama.processed_episodes}/{drama.total_episodes}\n"
-            f"   📅 Last check: {last_check}\n\n"
+            f"   📅 Last Check: {last_check}\n"
         )
         
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🗑️ Remove: {name[:30]}",
-                callback_data=f"unmonitor_{name}"
-            )
-        ])
+        if drama.failed_episodes:
+            monitored_text += f"   ❌ Failed: {len(drama.failed_episodes)} episode(s)\n"
+        
+        monitored_text += "\n"
     
-    next_check = datetime.now() + timedelta(hours=3)
-    monitored_text += (
-        f"\n🔄 **Next check:** {next_check.strftime('%H:%M')}\n"
-        f"⚙️ **Check interval:** Every 3 hours"
-    )
-    
-    await message.reply_text(
-        monitored_text, 
-        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
-    )
+    await message.reply_text(monitored_text)
 
 @app.on_message(filters.command("toggle_monitoring") & filters.private)
 @admin_only
 async def toggle_monitoring_command(client: Client, message: Message):
-    """Toggle automatic monitoring"""
+    """Toggle monitoring command handler"""
     bot_status["monitoring"] = not bot_status["monitoring"]
     status = "enabled" if bot_status["monitoring"] else "disabled"
+    await message.reply_text(f"👁️ Monitoring has been **{status}**")
+
+@app.on_message(filters.command("retry_failed") & filters.private)
+@admin_only
+async def retry_failed_command(client: Client, message: Message):
+    """Retry failed episodes command handler"""
+    if bot_status["processing"]:
+        await message.reply_text("❌ Bot is currently processing. Please wait.")
+        return
+    
+    # Find dramas with failed episodes
+    dramas_with_failures = []
+    for drama in drama_queue + list(monitored_dramas.values()):
+        if drama.failed_episodes:
+            dramas_with_failures.append(drama)
+    
+    if not dramas_with_failures:
+        await message.reply_text("✅ No failed episodes to retry.")
+        return
     
     await message.reply_text(
-        f"👁️ **Monitoring {status.upper()}**\n\n"
-        f"{'🔄 Will check for new episodes every 3 hours' if bot_status['monitoring'] else '⏸️ No automatic checks will be performed'}\n\n"
-        f"**Monitored dramas:** {len(monitored_dramas)}"
+        f"🔁 **Found {len(dramas_with_failures)} drama(s) with failed episodes**\n\n"
+        f"Starting retry process..."
     )
+    
+    for drama in dramas_with_failures:
+        # Clear failed episodes list to allow retry
+        failed_count = len(drama.failed_episodes)
+        drama.failed_episodes = []
+        save_data()
+        
+        await client.send_message(
+            ADMIN_ID,
+            f"🔁 **Retrying Failed Episodes**\n\n"
+            f"📺 {drama.name}\n"
+            f"🔢 {failed_count} failed episode(s)\n"
+            f"🚀 Starting retry..."
+        )
+        
+        await process_drama(drama, client)
 
 @app.on_callback_query()
-async def callback_handler(client: Client, callback_query: CallbackQuery):
-    """Handle all callback queries"""
+async def callback_query_handler(client: Client, callback_query: CallbackQuery):
+    """Handle callback queries"""
     try:
         data = callback_query.data
         
-        # Add drama to queue
-        if data.startswith("add_drama_"):
+        if data.startswith("select_drama_"):
             index = int(data.split("_")[-1])
             
             if hasattr(app, 'search_results') and index < len(app.search_results):
                 selected = app.search_results[index]
                 
-                # Check if already exists
-                if any(d.name == selected['name'] for d in drama_queue):
-                    await callback_query.answer("⚠️ Already in queue!", show_alert=True)
-                    return
-                
-                if selected['name'] in monitored_dramas:
-                    await callback_query.answer("⚠️ Already being monitored!", show_alert=True)
-                    return
-                
-                # Create and add drama
                 drama = Drama(
                     name=selected['name'],
                     url=selected['url'],
                     total_episodes=0,
-                    status="queued",
-                    added_date=datetime.now().isoformat()
+                    status="pending",
+                    failed_episodes=[]
                 )
                 
                 drama_queue.append(drama)
                 save_data()
                 
-                await callback_query.answer("✅ Added to queue!", show_alert=False)
                 await callback_query.edit_message_text(
-                    f"✅ **Added to Queue!**\n\n"
+                    f"✅ **Added to Queue**\n\n"
                     f"📺 **Drama:** {drama.name}\n"
-                    f"📋 **Queue Position:** #{len(drama_queue)}\n"
-                    f"📤 **Upload to:** Chat ID `{TELEGRAM_CHAT_ID}`\n\n"
-                    f"**Options:**\n"
-                    f"• `/search` - Add more dramas\n"
-                    f"• `/queue` - View queue\n"
-                    f"• `/go` - Start processing all"
+                    f"🔗 **URL:** {drama.url}\n"
+                    f"📋 **Queue Position:** {len(drama_queue)}\n"
+                    f"📤 **Will upload to:** Chat ID `{TELEGRAM_CHAT_ID}`\n"
+                    f"🔁 **Retry attempts:** {MAX_EPISODE_RETRIES} per episode"
                 )
-        
-        # Remove drama from queue
-        elif data.startswith("remove_drama_"):
-            index = int(data.split("_")[-1])
-            
-            if 0 <= index < len(drama_queue):
-                removed = drama_queue.pop(index)
-                save_data()
                 
-                await callback_query.answer("🗑️ Removed!", show_alert=False)
-                await callback_query.edit_message_text(
-                    f"🗑️ **Removed from Queue**\n\n"
-                    f"📺 **{removed.name}**\n\n"
-                    f"Use `/queue` to view current queue."
-                )
+                if not bot_status["processing"]:
+                    await process_next_in_queue(client)
         
-        # Start processing all
-        elif data == "start_all":
-            if bot_status["processing"] or bot_status["queue_running"]:
-                await callback_query.answer("⚠️ Already running!", show_alert=True)
-                return
-            
-            if not drama_queue:
-                await callback_query.answer("📋 Queue is empty!", show_alert=True)
-                return
-            
-            bot_status["queue_running"] = True
-            save_data()
-            
-            await callback_query.answer("🚀 Starting...", show_alert=False)
-            await callback_query.edit_message_text(
-                f"🚀 **Processing Started!**\n\n"
-                f"📋 Processing {len(drama_queue)} drama(s)\n"
-                f"⏹️ Use `/stop` to stop"
-            )
-            
-            asyncio.create_task(process_all_dramas(client))
-        
-        # Stop processing
-        elif data == "stop_all":
-            bot_status["queue_running"] = False
-            save_data()
-            
-            await callback_query.answer("⏹️ Stopping...", show_alert=False)
-            await callback_query.edit_message_text(
-                f"⏹️ **Stopped!**\n\n"
-                f"Current episode will finish.\n"
-                f"Use `/go` to resume."
-            )
-        
-        # Clear entire queue
-        elif data == "clear_all":
-            if bot_status["processing"]:
-                await callback_query.answer("⚠️ Cannot clear while processing!", show_alert=True)
-                return
-            
-            count = len(drama_queue)
-            drama_queue.clear()
-            save_data()
-            
-            await callback_query.answer("🗑️ Cleared!", show_alert=False)
-            await callback_query.edit_message_text(
-                f"🗑️ **Queue Cleared!**\n\n"
-                f"Removed {count} drama(s)."
-            )
-        
-        # Remove from monitoring
-        elif data.startswith("unmonitor_"):
-            drama_name = data[10:]  # Remove "unmonitor_" prefix
-            
-            if drama_name in monitored_dramas:
-                del monitored_dramas[drama_name]
-                save_data()
-                
-                await callback_query.answer("🗑️ Removed from monitoring!", show_alert=False)
-                await callback_query.edit_message_text(
-                    f"🗑️ **Removed from Monitoring**\n\n"
-                    f"📺 **{drama_name}**\n\n"
-                    f"No longer checking for new episodes."
-                )
-        
-        # Cancel upload/download
         elif data.startswith("cancel_"):
             parts = data.split("_")
             if len(parts) >= 4:
                 chat_id = parts[1]
                 mes_id = parts[2]
                 cancelled_downloads.add(f"{chat_id}_{mes_id}")
-                await callback_query.answer("❌ Cancelled!", show_alert=True)
+                try:
+                    await callback_query.answer("❌ Cancelled!")
+                except:
+                    pass
+                return
         
-        else:
+        try:
             await callback_query.answer()
+        except:
+            pass
         
     except Exception as e:
         logger.error(f"Callback error: {e}")
         try:
-            await callback_query.answer("❌ Error occurred!", show_alert=True)
+            await callback_query.answer("❌ Error!")
         except:
             pass
 
-async def process_all_dramas(client: Client):
-    """Process all dramas in queue sequentially"""
-    try:
-        logger.info("Starting queue processing...")
-        
-        processed_count = 0
-        failed_count = 0
-        
-        while bot_status["queue_running"]:
-            # Find next queued drama
-            next_drama = None
-            for drama in drama_queue:
-                if drama.status == "queued":
-                    next_drama = drama
-                    break
-            
-            if not next_drama:
-                # No more queued dramas
-                break
-            
-            # Process the drama
-            await process_drama(next_drama, client)
-            
-            if next_drama.status == "completed":
-                processed_count += 1
-            else:
-                failed_count += 1
-            
-            # Small delay between dramas
-            await asyncio.sleep(5)
-        
-        # Processing complete
-        bot_status["queue_running"] = False
-        save_data()
-        
-        remaining = len([d for d in drama_queue if d.status == "queued"])
-        
-        await client.send_message(
-            ADMIN_ID,
-            f"✅ **Queue Processing Complete!**\n\n"
-            f"📊 **Summary:**\n"
-            f"✅ Completed: {processed_count}\n"
-            f"❌ Failed: {failed_count}\n"
-            f"⏳ Remaining: {remaining}\n\n"
-            f"👁️ **Monitoring:** {len(monitored_dramas)} drama(s)\n\n"
-            f"{'⚠️ Use `/go` to process remaining dramas' if remaining > 0 else '🎉 All dramas processed!'}"
-        )
-        
-        logger.info(f"Queue processing complete: {processed_count} completed, {failed_count} failed")
-        
-    except Exception as e:
-        logger.error(f"Queue processing error: {e}")
-        bot_status["queue_running"] = False
-        save_data()
-        
-        await client.send_message(
-            ADMIN_ID,
-            f"❌ **Queue Processing Error**\n\n"
-            f"Error: {str(e)}\n\n"
-            f"Use `/status` to check current state."
-        )
-
-async def monitoring_task():
-    """Background task to check for new episodes every 3 hours"""
-    await asyncio.sleep(60)  # Wait 1 minute after startup
+async def process_next_in_queue(client: Client):
+    """Process the next drama in the queue"""
+    if not drama_queue or bot_status["processing"]:
+        return
     
+    for drama in drama_queue:
+        if drama.status == "pending":
+            await process_drama(drama, client)
+            break
+
+# Background task for monitoring
+async def monitoring_task():
+    """Background task to check for new episodes"""
     while True:
         try:
-            if bot_status["monitoring"] and not bot_status["processing"]:
-                logger.info("Running monitoring check...")
+            if bot_status["monitoring"]:
                 await check_for_new_episodes(app)
-            
-            # Wait 3 hours
-            await asyncio.sleep(3 * 60 * 60)
-            
         except Exception as e:
             logger.error(f"Monitoring task error: {e}")
-            await asyncio.sleep(60)  # Wait 1 minute before retrying
+        
+        await asyncio.sleep(3 * 60 * 60)  # Wait 3 hours
 
 async def main():
     """Main function"""
+    # Load saved data
+    load_data()
+    
+    # Create directories
+    for folder in [OUTPUT_DIR, DOWNLOAD_FOLDER, DONE_FOLDER, TEMP_FOLDER]:
+        os.makedirs(folder, exist_ok=True)
+    
+    # Start the bot
+    await app.start()
+    logger.info("Bot started successfully")
+    
+    # Send startup message
     try:
-        # Load saved data
-        load_data()
-        
-        # Create directories
-        for folder in [OUTPUT_DIR, DOWNLOAD_FOLDER, DONE_FOLDER, TEMP_FOLDER]:
-            os.makedirs(folder, exist_ok=True)
-        
-        # Start the bot
-        await app.start()
-        logger.info("✅ Bot started successfully")
-        
-        # Send startup message
-        try:
-            startup_msg = (
-                f"🚀 **Bot Started Successfully!**\n\n"
-                f"📤 **Upload to:** Chat ID `{TELEGRAM_CHAT_ID}`\n"
-                f"👤 **Admin:** User ID `{ADMIN_ID}`\n\n"
-                f"📋 **Queue:** {len(drama_queue)} drama(s)\n"
-                f"👁️ **Monitoring:** {len(monitored_dramas)} drama(s)\n"
-                f"💾 **Free space:** {get_free_space_gb():.2f} GB\n\n"
-            )
-            
-            if drama_queue:
-                queued = len([d for d in drama_queue if d.status == "queued"])
-                if queued > 0:
-                    startup_msg += f"⚠️ **{queued} drama(s) in queue!**\nUse `/go` to start processing.\n\n"
-            
-            startup_msg += "✅ **Ready to receive commands!**"
-            
-            await app.send_message(ADMIN_ID, startup_msg)
-        except Exception as e:
-            logger.error(f"Could not send startup message: {e}")
-        
-        # Start monitoring task
-        monitoring_task_handle = asyncio.create_task(monitoring_task())
-        logger.info("✅ Monitoring task started")
-        
-        # Keep the bot running
-        await idle()
-        
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        total_failed = sum(len(drama.failed_episodes) for drama in drama_queue + list(monitored_dramas.values()))
+        await app.send_message(
+            ADMIN_ID,
+            f"🚀 **Bot Started**\n\n"
+            f"📤 **Upload to:** Chat ID `{TELEGRAM_CHAT_ID}`\n"
+            f"📋 **Queue:** {len(drama_queue)}\n"
+            f"👁️ **Monitored:** {len(monitored_dramas)}\n"
+            f"🔄 **Monitoring:** {'Enabled' if bot_status['monitoring'] else 'Disabled'}\n"
+            f"🔁 **Max Retries:** {MAX_EPISODE_RETRIES} per episode\n"
+            f"❌ **Failed Episodes:** {total_failed}"
+        )
     except Exception as e:
-        logger.error(f"Main error: {e}")
-    finally:
-        await app.stop()
-        logger.info("Bot stopped")
+        logger.error(f"Startup message error: {e}")
+    
+    # Start monitoring task
+    asyncio.create_task(monitoring_task())
+    
+    # Process pending queue
+    if drama_queue and not bot_status["processing"]:
+        await process_next_in_queue(app)
+    
+    # Keep the bot running
+    await idle()
 
 if __name__ == "__main__":
+    print("🚀 Starting Turkish123 Drama Bot...")
+    logger.info("Starting bot")
+    
     try:
-        asyncio.run(main())
+        app.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user (KeyboardInterrupt)")
+        print("\n⏹️ Bot stopped")
+        logger.info("Bot stopped")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+        print(f"\n💥 Error: {e}")
+        logger.error(f"Error: {e}")
+    finally:
+        save_data()
+        executor.shutdown(wait=True)
+        logger.info("Shutdown complete")
